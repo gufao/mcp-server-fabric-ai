@@ -1,37 +1,45 @@
-# Use Node.js LTS image
 FROM node:20-slim
 
-# Install fabric-ai CLI
+# Install fabric-ai CLI using official installer and download patterns
 RUN apt-get update && \
     apt-get install -y curl git && \
-    curl -fsSL https://raw.githubusercontent.com/danielmiessler/fabric/main/install.sh | bash && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \
+    curl -fsSL https://raw.githubusercontent.com/danielmiessler/fabric/main/scripts/installer/install.sh | bash && \
+    mv /root/.local/bin/fabric /usr/local/bin/fabric && \
+    chmod +x /usr/local/bin/fabric && \
+    ln -s /usr/local/bin/fabric /usr/local/bin/fabric-ai && \
+    # Download patterns using git clone
+    mkdir -p /usr/share/fabric && \
+    git clone --depth 1 https://github.com/danielmiessler/fabric.git /tmp/fabric-repo && \
+    # Copy patterns from data/patterns directory (correct location in repo)
+    cp -r /tmp/fabric-repo/data/patterns /usr/share/fabric/ && \
+    rm -rf /tmp/fabric-repo && \
+    chmod -R 755 /usr/share/fabric
 
-# Set working directory
 WORKDIR /app
 
-# Set Node environment
-ENV NODE_ENV=production
-
-# Copy package files first for better caching
+# Copy package files
 COPY package*.json ./
 COPY tsconfig.json ./
 
-# Install dependencies
-RUN npm ci --only=production
+# Install ALL dependencies (including devDependencies for build)
+RUN npm ci
 
-# Copy TypeScript source
+# Copy source
 COPY src/ ./src/
 
 # Build TypeScript
 RUN npm run build
 
-# Create non-root user
-RUN useradd -m -u 1000 mcpuser && \
-    chown -R mcpuser:mcpuser /app
+# Remove devDependencies for production
+RUN npm prune --production
 
-# Switch to non-root user
-USER mcpuser
+# Set production environment
+ENV NODE_ENV=production
 
-# Run the server
+# Set permissions - use existing 'node' user (UID 1000) from base image
+RUN chown -R node:node /app
+
+USER node
+
 CMD ["node", "dist/index.js"]

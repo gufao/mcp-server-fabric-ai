@@ -13,6 +13,9 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { exec } from "child_process";
 import { promisify } from "util";
+import { readdir } from "fs/promises";
+import { join } from "path";
+import { homedir } from "os";
 
 const execAsync = promisify(exec);
 
@@ -50,10 +53,108 @@ function validateRequired(value: string | undefined, name: string): string {
  */
 async function checkFabricInstalled(): Promise<boolean> {
   try {
-    await execAsync("which fabric");
+    await execAsync("which fabric-ai", { timeout: 5000 });
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Execute command with proper timeout handling
+ */
+async function execWithTimeout(
+  command: string,
+  timeoutMs: number,
+  maxBuffer: number = 1024 * 1024
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = exec(command, { maxBuffer, timeout: timeoutMs }, (error, stdout, stderr) => {
+      if (error) {
+        if (error.killed || error.signal === "SIGTERM") {
+          reject(new Error(`Command timed out after ${timeoutMs}ms`));
+        } else {
+          reject(error);
+        }
+      } else {
+        resolve({ stdout, stderr });
+      }
+    });
+
+    // Additional safety timeout
+    const safetyTimeout = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new Error(`Command timed out after ${timeoutMs}ms`));
+    }, timeoutMs + 1000);
+
+    child.on("exit", () => clearTimeout(safetyTimeout));
+  });
+}
+
+/**
+ * Get Fabric patterns directory path
+ * Try multiple locations: shared system path, user config, root config
+ */
+function getFabricPatternsDir(): string {
+  const possiblePaths = [
+    "/usr/share/fabric/patterns",
+    join(homedir(), ".config", "fabric", "patterns"),
+    join("/root", ".config", "fabric", "patterns"),
+  ];
+
+  // Return first path that exists, or default to first option
+  return possiblePaths[0];
+}
+
+/**
+ * List patterns by reading the patterns directory directly
+ */
+async function listPatternsFromFileSystem(): Promise<string[]> {
+  try {
+    const patternsDir = getFabricPatternsDir();
+    const entries = await readdir(patternsDir, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort();
+  } catch (error) {
+    logger.error("Error reading patterns from filesystem:", error);
+    return [];
+  }
+}
+
+/**
+ * List available models from Fabric configuration
+ */
+async function listModels(): Promise<string> {
+  logger.info("Listing available models");
+
+  try {
+    // Try CLI first with short timeout
+    try {
+      const { stdout } = await execWithTimeout("fabric-ai --listmodels", 5000);
+      return `📋 Available Models:\n\n${stdout}`;
+    } catch (cliError) {
+      logger.warn("CLI failed for listmodels:", cliError);
+
+      // Return helpful message
+      return `ℹ️ Models are configured via the Fabric CLI setup.
+
+To configure models:
+1. Run: fabric-ai --setup
+2. Add your API keys for supported providers (OpenAI, Anthropic, etc.)
+
+Common model names:
+- gpt-4
+- gpt-4-turbo
+- claude-3-opus
+- claude-3-sonnet
+
+Note: The actual available models depend on your Fabric configuration.`;
+    }
+  } catch (error) {
+    logger.error("Error in listModels:", error);
+    return formatError(error);
   }
 }
 
@@ -75,15 +176,12 @@ async function executePattern(
     const validInput = validateRequired(inputText, "input_text");
 
     // Build command
-    let command = `echo ${JSON.stringify(validInput)} | fabric --pattern ${validPattern}`;
+    let command = `echo ${JSON.stringify(validInput)} | fabric-ai --pattern ${validPattern}`;
     if (model) {
       command += ` --model ${model}`;
     }
 
-    const { stdout, stderr } = await execAsync(command, {
-      timeout: 60000, // 60 second timeout
-      maxBuffer: 5 * 1024 * 1024, // 5MB buffer
-    });
+    const { stdout, stderr } = await execWithTimeout(command, 60000, 5 * 1024 * 1024);
 
     if (stderr) {
       logger.warn("Pattern stderr:", stderr);
@@ -103,23 +201,41 @@ async function listPatterns(search: string = ""): Promise<string> {
   logger.info("Listing available patterns");
 
   try {
-    const { stdout } = await execAsync("fabric --listpatterns", {
-      timeout: 10000,
-      maxBuffer: 1024 * 1024, // 1MB
-    });
-
-    const patterns = stdout
-      .split("\n")
-      .filter((p) => p.trim())
-      .filter((p) => !search || p.toLowerCase().includes(search.toLowerCase()));
+    // Try filesystem first (faster and more reliable)
+    const patterns = await listPatternsFromFileSystem();
 
     if (patterns.length === 0) {
-      return search
-        ? `❌ No patterns found matching: ${search}`
-        : "❌ No patterns available";
+      // If filesystem fails, try CLI as fallback
+      try {
+        const { stdout } = await execWithTimeout("fabric-ai --listpatterns", 5000);
+        const cliPatterns = stdout
+          .split("\n")
+          .filter((p) => p.trim())
+          .filter((p) => !search || p.toLowerCase().includes(search.toLowerCase()));
+
+        if (cliPatterns.length === 0) {
+          return search
+            ? `❌ No patterns found matching: ${search}`
+            : "❌ No patterns available";
+        }
+
+        return `📋 Available Patterns (${cliPatterns.length}):\n\n${cliPatterns.join("\n")}`;
+      } catch (cliError) {
+        logger.warn("Both filesystem and CLI failed:", cliError);
+        return "❌ No patterns available. Fabric may not be properly configured.";
+      }
     }
 
-    return `📋 Available Patterns (${patterns.length}):\n\n${patterns.join("\n")}`;
+    // Filter patterns if search term provided
+    const filtered = patterns.filter(
+      (p) => !search || p.toLowerCase().includes(search.toLowerCase())
+    );
+
+    if (filtered.length === 0) {
+      return `❌ No patterns found matching: ${search}`;
+    }
+
+    return `📋 Available Patterns (${filtered.length}):\n\n${filtered.join("\n")}`;
   } catch (error) {
     logger.error("Error in listPatterns:", error);
     return formatError(error);
@@ -137,7 +253,7 @@ async function getPatternDetails(patternName: string = ""): Promise<string> {
 
     // Try to get pattern system prompt
     const { stdout, stderr } = await execAsync(
-      `fabric --pattern ${validPattern} --help || echo "Pattern: ${validPattern}"`,
+      `fabric-ai --pattern ${validPattern} --help || echo "Pattern: ${validPattern}"`,
       {
         timeout: 5000,
       }
@@ -169,15 +285,12 @@ async function processUrl(
     const validPattern = validateRequired(patternName, "pattern_name");
 
     // Build command
-    let command = `fabric -u ${JSON.stringify(validUrl)} --pattern ${validPattern}`;
+    let command = `fabric-ai -u ${JSON.stringify(validUrl)} --pattern ${validPattern}`;
     if (model) {
       command += ` --model ${model}`;
     }
 
-    const { stdout, stderr } = await execAsync(command, {
-      timeout: 120000, // 2 minute timeout for URL fetching
-      maxBuffer: 5 * 1024 * 1024,
-    });
+    const { stdout, stderr } = await execWithTimeout(command, 120000, 5 * 1024 * 1024);
 
     if (stderr) {
       logger.warn("URL processing stderr:", stderr);
@@ -205,15 +318,12 @@ async function processYoutube(
     const validPattern = validateRequired(patternName, "pattern_name");
 
     // Build command
-    let command = `fabric -y ${JSON.stringify(validUrl)} --pattern ${validPattern}`;
+    let command = `fabric-ai -y ${JSON.stringify(validUrl)} --pattern ${validPattern}`;
     if (model) {
       command += ` --model ${model}`;
     }
 
-    const { stdout, stderr } = await execAsync(command, {
-      timeout: 180000, // 3 minute timeout for YouTube processing
-      maxBuffer: 5 * 1024 * 1024,
-    });
+    const { stdout, stderr } = await execWithTimeout(command, 180000, 5 * 1024 * 1024);
 
     if (stderr) {
       logger.warn("YouTube processing stderr:", stderr);
@@ -233,9 +343,7 @@ async function updatePatterns(): Promise<string> {
   logger.info("Updating Fabric patterns");
 
   try {
-    const { stdout, stderr } = await execAsync("fabric --update", {
-      timeout: 60000, // 1 minute timeout
-    });
+    const { stdout, stderr } = await execWithTimeout("fabric-ai --update", 60000);
 
     if (stderr) {
       logger.warn("Update stderr:", stderr);
@@ -373,6 +481,15 @@ const TOOLS: Tool[] = [
       properties: {},
     },
   },
+  {
+    name: "list_models",
+    description:
+      "List all available AI models configured in Fabric. Returns information about configured models and setup instructions.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
 ];
 
 // Handle tool listing
@@ -463,6 +580,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case "list_models": {
+        return {
+          content: [
+            {
+              type: "text",
+              text: await listModels(),
+            },
+          ],
+        };
+      }
+
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -482,25 +610,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // === SERVER STARTUP ===
 
-async function main() {
-  logger.info("Starting Fabric AI MCP server...");
+logger.info("Starting Fabric AI MCP server...");
 
-  // Check if fabric is installed
-  const fabricInstalled = await checkFabricInstalled();
-  if (!fabricInstalled) {
-    logger.error(
-      "Fabric CLI is not installed! Please install it from: https://github.com/danielmiessler/fabric"
-    );
-    process.exit(1);
-  }
-
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-
-  logger.info("Fabric AI MCP server running on stdio");
+// Check if fabric is installed
+const fabricInstalled = await checkFabricInstalled();
+if (!fabricInstalled) {
+  logger.warn(
+    "Fabric CLI is not installed! Server will run in limited mode (listing patterns only)."
+  );
+  logger.warn(
+    "To enable full functionality, install Fabric from: https://github.com/danielmiessler/fabric"
+  );
 }
 
-main().catch((error) => {
-  logger.error("Fatal error:", error);
-  process.exit(1);
-});
+const transport = new StdioServerTransport();
+await server.connect(transport);
+
+logger.info("Fabric AI MCP server running on stdio");
